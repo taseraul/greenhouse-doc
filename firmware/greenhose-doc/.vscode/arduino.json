@@ -1,0 +1,6 @@
+{
+    "board": "esp32:esp32:esp32",
+    "port": "COM3",
+    "sketch": "greenhose-doc.ino",
+    "output": "build"
+}

@@ -20,7 +20,7 @@ function epochToDateTime(epochTime) {
 function plotValues(chart, timestamp, value) {
   var x = epochToJsDate(timestamp).getTime();
   var y = Number(value);
-  if (chart.series[0].data.length > 40) {
+  if (chart.series[0].data.length > 50) {
     chart.series[0].addPoint([x, y], true, true, true);
   } else {
     chart.series[0].addPoint([x, y], true, false, true);
@@ -91,7 +91,7 @@ function populateDevice(device) {
       var dataRef = firebase.database().ref(dataPath);
 
       var chartT = createTemperatureChart(snapshot.val().name, chartContainer.id);
-      dataRef.limitToLast(20).orderByChild("timestamp").on("child_added", data => {
+      dataRef.limitToLast(100).orderByChild("timestamp").on("child_added", data => {
         let logPoints = data.val();
         // console.log(logPoints);
         // console.log(Object.keys(logPoints));

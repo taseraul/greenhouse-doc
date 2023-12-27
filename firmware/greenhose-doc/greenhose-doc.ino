@@ -1,77 +1,60 @@
 #include <Firebase_ESP_Client.h>
 #include <DNSServer.h>
 
-// Provide the token generation process info.
 #include "addons/TokenHelper.h"
-// Provide the RTDB payload printing info and other helper functions.
 #include "addons/RTDBHelper.h"
 
 #include <ESPAsyncWebServer.h>
 #include <AsyncElegantOTA.h>
 #include <WebSerial.h>
 #include <Preferences.h>
+#include "SPIFFS.h"
 
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include "webpage.h"
 
 #define RELAY_ON 4
-#define RELAY_OFF 5
-
+#define RELAY_OFF 16
+#define CONF_PIN 17
 #define LED_PIN 13
-
-// GPIO where the DS18B20 is connected to
 #define ONE_WIRE_PIN 33
 
 #define BATTERY_PIN 36
 
-// #define DEBUG
-
-#define uS_TO_S_FACTOR 1000000 /* Conversion factor for micro seconds to seconds */
-#define TIME_TO_SLEEP 300      /* Time ESP32 will go to sleep (in seconds) */
+#define uS_TO_MIN_FACTOR 60000000
+#define TIME_TO_SLEEP 300
 
 #define API_KEY "AIzaSyC7Sk72AEjvyrU85-g8EpQJe3b9CFn-rvA"
-
-// Insert RTDB URLefine the RTDB URL
 #define DATABASE_URL "https://greenhouse-doc-default-rtdb.europe-west1.firebasedatabase.app"
 
-String appVersion = "0";
+OneWire oneWire(ONE_WIRE_PIN);
+DallasTemperature sensors(&oneWire);
+
+const char* ntpServer = "pool.ntp.org";
+
+String appVersion = "0.3";
+
+typedef struct {
+  uint16_t timeout;
+  uint32_t nextRelayChange;
+  bool nextState;
+} DeviceInfo;
+
+DeviceInfo devInfo;
 
 Preferences conf;
 AsyncWebServer server(80);
 DNSServer dnsServer;
 
+String uid;
+String configPath;
+String dataPath;
+FirebaseJson json;
 FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
 
-// Variable to save USER UID
-String uid;
-
-// Database main path (to be updated in setup with the user UID)
-// Parent Node (to be updated in every loop)
-String databasePath;
-String configPath;
-String dataPath;
-
-// Database child nodes
-String tempPath = "/temperature";
-String timePath = "/timestamp";
-String batteryPath = "/battery";
-
-
 int timestamp;
-FirebaseJson json;
-
-const char* ntpServer = "pool.ntp.org";
-
-// Setup a oneWire instance to communicate with any OneWire devices
-OneWire oneWire(ONE_WIRE_PIN);
-
-// Pass our oneWire reference to Dallas Temperature sensor
-DallasTemperature sensors(&oneWire);
-
-
 bool isAP = false;
 bool ok = false;
 bool connected = false;
@@ -79,10 +62,10 @@ String ssid;
 String password;
 
 void addServerPaths() {
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
-    request->send(200, "text/html", index_html);
+  server.on("/index.html", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send(SPIFFS, "/index.html", String(), false);
   });
-  AsyncElegantOTA.begin(&server);  // Start AsyncElegantOTA
+  AsyncElegantOTA.begin(&server);
   WebSerial.begin(&server);
 }
 
@@ -100,13 +83,7 @@ public:
   }
 
   void handleRequest(AsyncWebServerRequest* request) {
-    AsyncResponseStream* response = request->beginResponseStream("text/html");
-    response->print("<!DOCTYPE html><html><head><title>Captive Portal</title></head><body>");
-    response->print("<p>This is out captive portal front page.</p>");
-    response->printf("<p>You were trying to reach: http://%s%s</p>", request->host().c_str(), request->url().c_str());
-    response->printf("<p>Try opening <a href='http://%s'>this link</a> instead</p>", WiFi.softAPIP().toString().c_str());
-    response->print("</body></html>");
-    request->send(response);
+    request->send(SPIFFS, "/index.html", String(), false);
   }
 };
 
@@ -122,179 +99,205 @@ unsigned long getTime() {
 }
 
 void recvMsg(uint8_t* data, size_t len) {
-  WebSerial.println("Received Data...");
   String d = "";
   for (int i = 0; i < len; i++) {
     d += char(data[i]);
   }
-  conf.putString("ssid", d.substring(0, d.indexOf(" ")));
-  conf.putString("pass", d.substring(d.indexOf(" ") + 1));
-  WebSerial.println(conf.getString("ssid", "Cezar"));
-  WebSerial.println(conf.getString("pass", "Beggingyou"));
-  ESP.restart();
-  // WebSerial.print("Echo :");
-  // WebSerial.println(d);
-  // connected = !connected;
+  if (isAP) {
+    conf.putString("ssid", d.substring(0, d.indexOf(" ")));
+    conf.putString("pass", d.substring(d.indexOf(" ") + 1));
+    WebSerial.println(conf.getString("ssid", "Cezar"));
+    WebSerial.println(conf.getString("pass", "Beggingyou"));
+    ESP.restart();
+  }
 }
 
 void setup(void) {
   conf.begin("greenhouse-doc", false);
 
   pinMode(ONE_WIRE_PIN, INPUT_PULLUP);
+  pinMode(CONF_PIN, INPUT_PULLUP);
   pinMode(LED_PIN, OUTPUT);
+  pinMode(RELAY_ON, OUTPUT);
+  pinMode(RELAY_OFF, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
-  ssid = conf.getString("ssid", "Cezar");
-  password = conf.getString("pass", "Beggingyou");
+  if (digitalRead(CONF_PIN)) {
+    ssid = conf.getString("ssid", "Cezar");
+    password = conf.getString("pass", "Beggingyou");
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid.c_str(), password.c_str());
-
-  int i = 30;
-  // Wait for connection
-  while ((WiFi.status() != WL_CONNECTED) && i) {
-    delay(500);
-    i--;
-    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), password.c_str());
+    while ((WiFi.status() != WL_CONNECTED)) {
+      delay(500);
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    }
+    digitalWrite(LED_PIN, LOW);
+#if 1
+    SPIFFS.begin(true);
+    WebSerial.msgCallback(recvMsg);
+    addServerPaths();
+    server.begin();
+#endif
   }
 
-  if (!i) {
+  else {
+    SPIFFS.begin(true);
     WiFi.disconnect();
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP("GreenHouse-Doc");
+    WebSerial.msgCallback(recvMsg);
     dnsServer.start(53, "*", WiFi.softAPIP());
     server.addHandler(new CaptiveRequestHandler()).setFilter(ON_AP_FILTER);  //only when requested from APF
     server.begin();
     isAP = true;
     digitalWrite(LED_PIN, HIGH);
-  } else {
-#ifdef DEBUG
-    server.begin();
-#endif
-    addServerPaths();
-    digitalWrite(LED_PIN, LOW);
   }
 
-  WebSerial.msgCallback(recvMsg);
   sensors.begin();
-
-  // WebSerial.println("Waiting to start ...");
-  // while (connected == false) {
-  //   delay(100);
-  // }
 
   if (!isAP) {
     configTime(0, 0, ntpServer);
-
     config.api_key = API_KEY;
-
-    // Assign the user sign in credentials
     auth.user.email = conf.getString("user", "tanasie.raul@gmail.com");
     auth.user.password = conf.getString("usr-pw", "beggingyou");
-
-    // Assign the RTDB URL (required)
     config.database_url = DATABASE_URL;
-
     Firebase.reconnectWiFi(true);
     fbdo.setResponseSize(4096);
-
-    // Assign the callback function for the long running token generation task */
-    config.token_status_callback = tokenStatusCallback;  //see addons/TokenHelper.h
-
-    // Assign the maximum retry of token generation
+    config.token_status_callback = tokenStatusCallback;
     config.max_token_generation_retry = 5;
-
-    // Initialize the library with the Firebase authen and config
     Firebase.begin(&config, &auth);
-
-    // Getting the user UID might take a few seconds
     while ((auth.token.uid) == "") {
       delay(1000);
     }
-    // Print user UID
     uid = auth.token.uid.c_str();
-
-    // Update database path
-    databasePath = "/devices/" + String(ESP.getEfuseMac());
   }
 }
 
+void sendDiscoverdAp() {
+  dnsServer.processNextRequest();
+  int n = WiFi.scanNetworks(false, false, true, 100U);
+  if (n == 0) {
+  } else {
+    WebSerial.print("0");
+    for (int i = 0; i < n; ++i) {
+      WebSerial.print(WiFi.SSID(i));
+      delay(10);
+    }
+  }
+}
 
-
-// The Firebase download callback function
-void rtdbDownloadCallback(RTDB_DownloadStatusInfo info) {
-  if (info.status == fb_esp_rtdb_download_status_init) {
-    Serial.printf("Downloading firmware file %s (%d)\n", info.remotePath.c_str(), info.size);
-  } else if (info.status == fb_esp_rtdb_download_status_download) {
-    Serial.printf("Downloaded %d%s, Elapsed time %d ms\n", (int)info.progress, "%", info.elapsedTime);
-  } else if (info.status == fb_esp_rtdb_download_status_complete) {
-    Serial.println("Update firmware completed.");
-    Serial.println();
-    Serial.println("Restarting...\n\n");
+void fcsDownloadCallback(FCS_DownloadStatusInfo info) {
+  if (info.status == fb_esp_fcs_download_status_complete) {
+    digitalWrite(LED_PIN, LOW);
+    delay(50);
+    digitalWrite(LED_PIN, HIGH);
+    delay(50);
+    digitalWrite(LED_PIN, LOW);
+    delay(50);
+    digitalWrite(LED_PIN, HIGH);
+    delay(50);
+    digitalWrite(LED_PIN, LOW);
+    delay(50);
+    digitalWrite(LED_PIN, HIGH);
+    delay(50);
+    digitalWrite(LED_PIN, LOW);
+    delay(50);
+    digitalWrite(LED_PIN, HIGH);
     delay(2000);
     ESP.restart();
-  } else if (info.status == fb_esp_rtdb_download_status_error) {
-    Serial.printf("Download failed, %s\n", info.errorMsg.c_str());
+  }
+}
+
+void checkFw() {
+  Firebase.RTDB.getString(&fbdo, "devices/firmwareVersion/temp_relay");
+  String version = fbdo.stringData();
+  if (version != appVersion) {
+    Firebase.Storage.downloadOTA(&fbdo, F("greenhouse-doc.appspot.com"), "firmware/temp_relay/firmware.bin", fcsDownloadCallback);
+  }
+}
+
+void getDeviceConf() {
+  String devicePath = "/devices/" + String(ESP.getEfuseMac());
+  String userDevicesPath = "/users/" + uid + "/devices";
+  FirebaseJson deviceJson;
+  FirebaseJsonData jsonData;
+  FirebaseJsonArray ownedDevices;
+  int i;
+
+  Firebase.RTDB.getString(&fbdo, devicePath + "/properties");
+  if (fbdo.stringData() == String("")) {
+    deviceJson.set("/properties/name", String("Generic temperature-relay"));
+    deviceJson.set("/properties/owner", uid);
+    deviceJson.set("/properties/type/[0]", "temperature");
+    deviceJson.set("/properties/type/[1]", "relay");
+    deviceJson.set("/properties/updateInterval", 5);
+    deviceJson.set("/properties/relay/nextTrigger", 0);
+    deviceJson.set("/properties/relay/nextState", false);
+    deviceJson.set("/properties/relay/state", false);
+
+    Firebase.RTDB.setJSON(&fbdo, devicePath.c_str(), &deviceJson);
+
+    Firebase.RTDB.getArray(&fbdo, userDevicesPath, &ownedDevices);
+    for (i = 0; i < ownedDevices.size(); i++) {
+      ownedDevices.get(jsonData, i);
+      if (jsonData.to<String>() == String(ESP.getEfuseMac()))
+        break;
+    }
+    if (i == ownedDevices.size()) {
+      ownedDevices.add(String(ESP.getEfuseMac()));
+      Firebase.RTDB.setArray(&fbdo, userDevicesPath.c_str(), &ownedDevices);
+    }
+    devInfo.nextState = false;
+    devInfo.nextRelayChange = 0;
+    devInfo.timeout = 5;
+  } else {
+    fbdo.jsonObject().get(jsonData, "/relay/nextState");
+    devInfo.nextState = jsonData.to<bool>();
+    fbdo.jsonObject().get(jsonData, "/relay/nextTrigger");
+    devInfo.nextRelayChange = jsonData.to<uint32_t>();
+    fbdo.jsonObject().get(jsonData, "/updateInterval");
+    devInfo.timeout = jsonData.to<uint16_t>();
   }
 }
 
 void loop() {
   if (isAP) {
-    dnsServer.processNextRequest();
-
-    // if (connected) {
-    int n = WiFi.scanNetworks(false, false, true, 100U);
-    // WebSerial.println("scan done");
-    delay(3000);
-    if (n == 0) {
-      // WebSerial.println("no networks found");
-    } else {
-      // WebSerial.print(n);
-      // WebSerial.println("networks found");
-      WebSerial.print("0");
-      for (int i = 0; i < n; ++i) {
-        // Print SSID and RSSI for each network found
-        WebSerial.print(WiFi.SSID(i));
-        delay(100);
-      }
-    }
+    sendDiscoverdAp();
     delay(10000);
-    // }
   } else {
     if (Firebase.ready()) {
-
-      //Get current timestamp
+      checkFw();
+      getDeviceConf();
       timestamp = getTime();
-
-      Firebase.RTDB.getString(&fbdo, "devices/firmwareVersion");
-      String version = fbdo.stringData();
-      if (version == appVersion) {
-        if (!Firebase.RTDB.downloadOTA(&fbdo, F("firmware/temp_relay"), rtdbDownloadCallback))
-          Serial.println(fbdo.errorReason());
-      }
       sensors.requestTemperatures();
       float temperatureC = sensors.getTempCByIndex(0);
-      // WebSerial.println(temperatureC);
 
       dataPath = "/devices/" + String(ESP.getEfuseMac()) + "/data/" + String(timestamp);
 
-
       int battReading = analogReadMilliVolts(BATTERY_PIN);
       uint8_t batteryPercentage = (battReading - 1500) / 600.0 * 100;
-      json.set(batteryPath.c_str(), String(batteryPercentage) + "%");
-      json.set(tempPath.c_str(), String(temperatureC));
-      json.set(timePath.c_str(), String(timestamp));
-      char output[100];
+      json.set("/battery", String(batteryPercentage) + "%");
+      json.set("/temperature", String(temperatureC));
+      json.set("/timestamp", String(timestamp));
+
       Firebase.RTDB.setJSON(&fbdo, dataPath.c_str(), &json);
 
-#ifdef DEBUG
-      delay(5000);
-#else
-      esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+      if (timestamp > devInfo.nextRelayChange) {
+        if (devInfo.nextState) {
+          digitalWrite(RELAY_ON, HIGH);
+          delay(200);
+          digitalWrite(RELAY_ON, LOW);
+        } else {
+          digitalWrite(RELAY_OFF, HIGH);
+          delay(200);
+          digitalWrite(RELAY_OFF, LOW);
+        }
+        Firebase.RTDB.setBool(&fbdo, "/devices/" + String(ESP.getEfuseMac()) + "/properties/relay/state", devInfo.nextState);
+      }
+
+      esp_sleep_enable_timer_wakeup(devInfo.timeout * uS_TO_MIN_FACTOR);
       esp_deep_sleep_start();
-#endif
-    } else {
-      WebSerial.println("auth_fail");
     }
   }
 }
